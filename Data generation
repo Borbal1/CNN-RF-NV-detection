@@ -1,0 +1,73 @@
+def generate_random_nv_cutout(size=11, amplitude_range=(0.5, 1.0), sigma_range=(3, 5), offset_range=(-1.0, 1.0)):
+    cutout = np.zeros((size, size), dtype=np.float32)
+    center = size // 2
+    amplitude = np.random.uniform(*amplitude_range)
+    sigma = np.random.uniform(*sigma_range)
+    offset_x = np.random.uniform(*offset_range)
+    offset_y = np.random.uniform(*offset_range)
+    x = np.arange(size)
+    y = np.arange(size)
+    xx, yy = np.meshgrid(x, y)
+    gauss = amplitude * np.exp(-((xx - center - offset_x) ** 2 + (yy - center - offset_y) ** 2) / (2 * sigma ** 2))
+
+    # Add nonuniform background
+    background = np.random.normal(loc=0.1, scale=0.03, size=(size, size))
+    gradient = np.linspace(0, 0.1, size).reshape(-1, 1)
+    cutout = gauss + background + gradient
+    return np.clip(cutout, 0, 1)
+
+def generate_fake_nv_cutout(size: int = 11) -> np.ndarray:
+  
+    cutout = np.random.normal(loc=0.10, scale=0.05,
+                              size=(size, size)).astype(np.float32)
+
+    if np.random.rand() > 0.05:                     # 70 % chance
+        center   = size // 2
+        amp      = np.random.uniform(0.4, 0.9)      # bright
+        sigma_x  = np.random.uniform(3.0, 5.0)      # broad in x
+        # make y-width 20–60 % larger or smaller than x
+        sigma_y  = sigma_x * np.random.uniform(0.9, 1.1)
+        theta    = np.random.uniform(-np.pi/6, np.pi/6)  # tilt ≤ 30°
+
+        # random centre offsets (keep blob inside frame)
+        dx = np.random.uniform(-2.0, 2.0)
+        dy = np.random.uniform(-2.0, 2.0)
+
+        # coordinate grids
+        x = np.arange(size) - (center + dx)
+        y = np.arange(size) - (center + dy)
+        xx, yy = np.meshgrid(x, y)
+
+        # rotate coordinates by theta
+        xr =  xx * np.cos(theta) + yy * np.sin(theta)
+        yr = -xx * np.sin(theta) + yy * np.cos(theta)
+
+        blob = amp * np.exp(-(xr**2 / (2 * sigma_x**2)
+                              + yr**2 / (2 * sigma_y**2)))
+        cutout += blob
+
+    return np.clip(cutout, 0.0, 1.0)
+
+
+def generate_dataset(n_good=1000, n_bad=1000, size=29):
+    X = []
+    y = []
+
+    for _ in range(n_good):
+        X.append(generate_random_nv_cutout(size)[..., np.newaxis])  # add channel dim
+        y.append(1)
+
+    for _ in range(n_bad):
+        X.append(generate_fake_nv_cutout(size)[..., np.newaxis])
+        y.append(0)
+
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.uint8)
+
+    # Shuffle the dataset
+    indices = np.arange(len(X))
+    np.random.shuffle(indices)
+    X = X[indices]
+    y = y[indices]
+
+    return X, y
