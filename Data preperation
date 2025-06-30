@@ -1,0 +1,145 @@
+"""
+Background-subtract, balance, save, rotate and *visualise* one GOOD / one BAD
+patch per scan, with the sample folder (e.g. 04A2, 07C1) shown in the
+header cell above each column (it stays inside the white space, so it
+cannot overlap the images).
+"""
+
+import re, h5py, numpy as np, matplotlib.pyplot as plt
+from pathlib import Path
+
+# ── CONFIG ─────────────────────────────────────────────────────────
+BASE_DIRS = [
+    r"(Path)\RTCS DATA\04A2",
+    r"(Path)\RTCS DATA\06A1",
+    r"(Path)\RTCS DATA\07C1",
+    r"(Path)\RTCS DATA\07C2",
+    r"(Path)\RTCS DATA\FH1",
+    r"(Path)\RTCS DATA\04B1",
+    r"(Path)\RTCS DATA\04B2",
+]
+IMG_PATH   = "/xy_scan/spatial_scan/photon_flux"
+ANGLE_PATH = "/xy_scan/settings/angle"
+BG_PATH    = "/settings/min_background_level"
+PIXEL_SIZE_NM_FALLBACK = 100
+PATCH_SIZE = 21
+h          = PATCH_SIZE // 2
+
+pat = re.compile(r"x=([-\d\.]+),\s*y=([-\d\.]+).*-\s*(GOOD|BAD)", re.I)
+
+all_patches, all_labels = [], []
+scan_vis                = []
+
+# ── SCAN LOOP ──────────────────────────────────────────────────────
+for base in BASE_DIRS:
+    sf, rs = Path(base) / "scan_fields", Path(base) / "results"
+    if not sf.is_dir() or not rs.is_dir():
+        continue
+
+    for sd in sf.iterdir():
+        if not sd.is_dir():
+            continue
+        h5s  = list(sd.glob("*Candidates.h5"))
+        txts = list(rs.glob(f"*_{sd.name}_xyz_positions_status.txt"))
+        if len(h5s) != 1 or len(txts) != 1:
+            continue
+        h5p, txtp = h5s[0], txts[0]
+
+        # load image + meta
+        with h5py.File(h5p, "r") as f:
+            img    = f[IMG_PATH][()].astype("float32")
+            pix_nm = f[IMG_PATH].attrs.get("pixel_size_nm",
+                                           PIXEL_SIZE_NM_FALLBACK)
+            angle  = float(f[ANGLE_PATH][()]) if ANGLE_PATH in f else 0.0
+            bg     = float(f[BG_PATH][()])    if BG_PATH   in f else 0.0
+        img = np.clip(img - bg, 0, None)
+
+        c, s  = np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle))
+        ny, nx = img.shape
+        pix_um, cy, cx = pix_nm / 1000.0, ny / 2, nx / 2
+
+        patches, labels = [], []
+        with open(txtp) as fh:
+            for line in fh:
+                m = pat.search(line)
+                if not m:
+                    continue
+                x_um, y_um = map(float, m.groups()[:2])
+                good       = m.group(3).upper() == "GOOD"
+
+                x_r =  x_um * c + y_um * s
+                y_r = -x_um * s + y_um * c
+
+                col = int(round(cx + x_r / pix_um))
+                row = int(round(cy - y_r / pix_um))
+
+                y0, y1 = row - h, row + h + 1
+                x0, x1 = col - h, col + h + 1
+                if y0 < 0 or x0 < 0 or y1 > ny or x1 > nx:
+                    continue
+
+                patch = img[y0:y1, x0:x1]
+                patches.append(patch)
+                labels.append(good)
+                all_patches.append(patch)
+                all_labels.append(good)
+
+        if patches:
+            scan_vis.append((sd.name, str(h5p), patches, labels))
+
+# ── BALANCE GOOD/BAD ───────────────────────────────────────────────
+all_patches = np.stack(all_patches)
+all_labels  = np.array(all_labels)
+good_idx = np.where(all_labels == 1)[0]
+bad_idx  = np.where(all_labels == 0)[0]
+
+rng       = np.random.default_rng(42)
+keep_bad  = rng.choice(bad_idx, size=len(good_idx), replace=False)
+sel_idx   = np.concatenate([good_idx, keep_bad])
+rng.shuffle(sel_idx)
+
+X_bal = all_patches[sel_idx]
+y_bal = all_labels[sel_idx]
+
+out_dir = Path(r"C:\Users\boris\OneDrive\Documents")
+np.save(out_dir / "X_balanced.npy", X_bal)
+np.save(out_dir / "y_balanced.npy", y_bal)
+print("Saved balanced, background-subtracted data:", X_bal.shape, y_bal.shape)
+
+# ── VISUALISATION ─────────────────────────────────────────────────
+n = len(scan_vis)
+fig, axes = plt.subplots(3, n, figsize=(2 * n, 6), constrained_layout=True)
+
+for i, (scan, h5path, patches, labels) in enumerate(scan_vis):
+    n_good = sum(labels)
+    n_bad  = len(labels) - n_good
+
+    sample_id = Path(h5path).parents[2].name  # e.g. '04A2'
+
+    # header cell (top row)
+    ax0 = axes[0, i]; ax0.axis("off")
+    ax0.text(0.5, 0.65, sample_id,
+             ha="center", va="center", fontsize=9, fontweight="bold")
+    ax0.text(0.5, 0.35, scan,
+             ha="center", va="center", fontsize=8)
+    ax0.text(0.5, 0.08, f"GOOD {n_good}   BAD {n_bad}",
+             ha="center", va="center", fontsize=8)
+
+    # GOOD patch
+    ax1 = axes[1, i]; ax1.axis("off")
+    if True in labels:
+        ax1.imshow(patches[labels.index(True)], cmap="hot", origin="upper")
+    else:
+        ax1.text(0.5, 0.5, "No GOOD", ha="center", va="center", fontsize=7)
+    ax1.set_ylabel("GOOD", rotation=0, labelpad=18, fontsize=8)
+
+    # BAD patch
+    ax2 = axes[2, i]; ax2.axis("off")
+    if False in labels:
+        ax2.imshow(patches[labels.index(False)], cmap="hot", origin="upper")
+    else:
+        ax2.text(0.5, 0.5, "No BAD", ha="center", va="center", fontsize=7)
+    ax2.set_ylabel("BAD", rotation=0, labelpad=22, fontsize=8)
+
+plt.suptitle("Per-scan counts and first GOOD/BAD examples", y=1.03)
+plt.show()
