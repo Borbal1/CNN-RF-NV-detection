@@ -1,0 +1,81 @@
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import train_test_split
+# Define input shape: 11x11 grayscale image
+input_shape = (29, 29, 1)
+
+model = Sequential()
+
+# Convolutional layer 1
+model.add(Conv2D(16, (3, 3), activation='relu', input_shape=input_shape))
+model.add(MaxPooling2D(pool_size=(2, 2)))
+
+# Convolutional layer 2
+model.add(Conv2D(32, (3, 3), activation='relu'))
+model.add(MaxPooling2D(pool_size=(2, 2)))
+
+# Fully connected layers
+model.add(Flatten())
+model.add(Dense(64, activation='relu'))
+model.add(Dropout(0.3))
+model.add(Dense(1, activation='sigmoid'))  # Output layer for binary classification
+
+# Compile the model
+model.compile(optimizer=Adam(learning_rate=0.001),
+              loss='binary_crossentropy',
+              metrics=['accuracy'])
+
+# View the architecture
+model.summary()
+
+# ----- Training -----
+X_train, y_train = generate_dataset(n_good=200, n_bad=500)
+X_val, y_val = generate_dataset(n_good=1000, n_bad=1000)
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=10,          # ← just 10 epochs now
+    batch_size=32,
+    verbose=1
+)
+
+# ----- Plot (unchanged style) -----
+import matplotlib.pyplot as plt
+
+loss     = history.history['loss']
+val_loss = history.history['val_loss']
+acc      = history.history['accuracy']
+val_acc  = history.history['val_accuracy']
+epochs   = range(1, len(loss) + 1)
+
+fig, ax1 = plt.subplots(figsize=(8, 5))
+
+ax1.plot(epochs, loss,     'b-', label='Train Loss')
+ax1.plot(epochs, val_loss, 'b--', label='Val Loss')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Loss', color='b')
+ax1.tick_params(axis='y', labelcolor='b')
+ax1.set_ylim(0,1)
+
+ax2 = ax1.twinx()
+ax2.plot(epochs, acc,      'r-', label='Train Acc')
+ax2.plot(epochs, val_acc,  'r--', label='Val Acc')
+ax2.set_ylabel('Accuracy', color='r')
+ax2.tick_params(axis='y', labelcolor='r')
+ax2.set_ylim(0,1)
+
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2,
+           loc='upper center', ncol=2)
+
+plt.title('Training History')
+fig.tight_layout()
+out_dir = Path(r"C:\Users\boris\OneDrive\Documents\TU delft\BEP\AfbeeldingenBEP")
+out_dir.mkdir(parents=True, exist_ok=True)
+   # 3. Save it with a chosen name in that folder
+file_path = out_dir / "faketraining.pdf"
+plt.savefig(file_path, bbox_inches="tight")
+plt.show()
