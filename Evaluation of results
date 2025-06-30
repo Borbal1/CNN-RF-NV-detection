@@ -1,0 +1,191 @@
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import numpy as np
+import os
+from sklearn.utils import resample
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+# Set path to save images
+save_path = r"C:\Users\boris\OneDrive\Pictures\Schermopnamen"
+os.makedirs(save_path, exist_ok=True)
+
+# --- Helper: Make Grad-CAM heatmap from a conv layer ---
+def make_gradcam_heatmap(img_batch, model, conv_layer_name):
+    grad_model = tf.keras.models.Model(
+        [model.inputs],
+        [model.get_layer(conv_layer_name).output, model.output]
+    )
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_batch)
+        loss = predictions[:, 0]
+
+    grads = tape.gradient(loss, conv_outputs)[0]
+    conv_outputs = conv_outputs[0]
+    weights = tf.reduce_mean(grads, axis=(0, 1))
+
+    cam = np.zeros(conv_outputs.shape[:2], dtype=np.float32)
+    for i, w in enumerate(weights):
+        cam += w * conv_outputs[:, :, i]
+
+    cam = np.maximum(cam, 0)
+    cam /= cam.max() if cam.max() != 0 else 1
+    return cam, weights.numpy(), conv_outputs.numpy()
+
+# --- Helper: Show Grad-CAM and activations ---
+def show_gradcam_result(img, label, title_prefix, conv_layer_name):
+    img_batch = np.expand_dims(img, axis=0)
+    heatmap, weights, conv_out = make_gradcam_heatmap(img_batch, model, conv_layer_name)
+
+    top_k = np.argsort(np.abs(weights))[::-1][:5]
+    print(f"{title_prefix} – Top 5 filters in {conv_layer_name}:", top_k)
+
+    # Grad-CAM overlay
+    plt.figure(figsize=(6, 3))
+    plt.subplot(1, 2, 1)
+    plt.imshow(img.squeeze(), cmap='gray')
+    plt.title("Original", fontsize=10)
+    plt.axis('off')
+
+    plt.subplot(1, 2, 2)
+    plt.imshow(img.squeeze(), cmap='hot')
+    plt.imshow(heatmap, cmap='hot', alpha=0.5)
+    plt.title("Grad-CAM", fontsize=10)
+    plt.axis('off')
+
+    plt.suptitle(title_prefix, fontsize=12)
+    plt.tight_layout()
+    filename_base = title_prefix.replace(" ", "_").replace("→", "to").replace("✅", "TP").replace("❌", "FP").replace("#", "")
+    plt.savefig(os.path.join(save_path, f"{filename_base}_gradcam.png"), dpi=300)
+    plt.show()
+
+    # Top filter activations
+    plt.figure(figsize=(15, 3))
+    for i, idx in enumerate(top_k):
+        plt.subplot(1, 5, i + 1)
+        plt.imshow(conv_out[:, :, idx], cmap='hot')
+        plt.title(f"Filter {idx}", fontsize=9)
+        plt.axis('off')
+
+    plt.suptitle(f"{title_prefix} - Top Activations", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, f"{filename_base}_activations.png"), dpi=300)
+    plt.show()
+
+# Predict on validation set
+y_prob_val = model.predict(X_val, verbose=0).ravel()
+y_pred_val = (y_prob_val > 0.5).astype(int)
+
+# Get names of conv layers
+conv_layer_names = [layer.name for layer in model.layers if isinstance(layer, tf.keras.layers.Conv2D)]
+first_conv = conv_layer_names[0]
+
+# Find indices of each category
+def find_n_indices(condition, n=3):
+    idxs = np.where(condition)[0]
+    return idxs[:n] if len(idxs) >= n else idxs
+
+TP_idxs = find_n_indices((y_val == 1) & (y_pred_val == 1), n=1)
+TN_idxs = find_n_indices((y_val == 0) & (y_pred_val == 0), n=1)
+FP_idxs = find_n_indices((y_val == 0) & (y_pred_val == 1), n=1)
+FN_idxs = find_n_indices((y_val == 1) & (y_pred_val == 0), n=1)
+
+# Run Grad-CAM and show + save
+for i, idx in enumerate(TP_idxs):
+    show_gradcam_result(X_val[idx], y_val[idx], f"✅ True Positive #{i+1} (GOOD → GOOD)", first_conv)
+for i, idx in enumerate(TN_idxs):
+    show_gradcam_result(X_val[idx], y_val[idx], f"✅ True Negative #{i+1} (BAD → BAD)", first_conv)
+for i, idx in enumerate(FP_idxs):
+    show_gradcam_result(X_val[idx], y_val[idx], f"❌ False Positive #{i+1} (BAD → GOOD)", first_conv)
+for i, idx in enumerate(FN_idxs):
+    show_gradcam_result(X_val[idx], y_val[idx], f"❌ False Negative #{i+1} (GOOD → BAD)", first_conv)
+
+
+# ---------- SETTINGS ----------
+N_PER_SPLIT   = 50
+PERPLEXITY    = 12
+LEARNING_RATE = 40
+RANDOM_STATE  = 42
+SAVE_PATH     = r"C:\Users\boris\OneDrive\Pictures\Schermopnamen"
+FILENAME      = "tsne_dense_train_test.pdf"
+
+# make sure the folder exists
+os.makedirs(SAVE_PATH, exist_ok=True)
+
+# ---------- 0) Stratified subsampling ----------
+rng = np.random.RandomState(RANDOM_STATE)
+
+train_idx_sub = resample(
+    np.arange(len(X_train)),
+    replace=False,
+    n_samples=min(N_PER_SPLIT, len(X_train)),
+    stratify=y_train,
+    random_state=rng
+)
+test_idx_sub = resample(
+    np.arange(len(X_test)),
+    replace=False,
+    n_samples=min(N_PER_SPLIT, len(X_test)),
+    stratify=y_test,
+    random_state=rng
+)
+
+X_vis = np.concatenate([X_train[train_idx_sub], X_test[test_idx_sub]], axis=0)
+y_vis = np.concatenate([y_train[train_idx_sub], y_test[test_idx_sub]], axis=0)
+split_vis = np.array([0]*len(train_idx_sub) + [1]*len(test_idx_sub))  # 0=train, 1=test
+N_TOTAL = len(X_vis)
+
+# ---------- 1) Extract dense-layer features ----------
+features_vis = feature_extractor.predict(X_vis, verbose=0)
+
+# ---------- 2) t-SNE embedding ----------
+tsne = TSNE(
+    n_components=2,
+    perplexity=PERPLEXITY,
+    learning_rate=LEARNING_RATE,
+    metric='euclidean',
+    init='pca',
+    random_state=RANDOM_STATE
+)
+Z_tsne = tsne.fit_transform(features_vis)
+
+# ---------- 3) Plot ----------
+cm_class   = ListedColormap(['red', 'blue'])   # BAD=red, GOOD=blue
+markers    = np.array(['o', '^'])              # o=train, ^=test
+labels_split  = ["Train", "Test"]
+labels_class  = ["BAD (0)", "GOOD (1)"]
+
+fig, ax = plt.subplots(figsize=(6.5, 5), dpi=120)
+
+for split in [0, 1]:
+    for cls in [0, 1]:
+        m = (split_vis == split) & (y_vis == cls)
+        ax.scatter(Z_tsne[m, 0], Z_tsne[m, 1],
+                   c=[cm_class(cls)],
+                   marker=markers[split],
+                   edgecolors='k',
+                   s=60,
+                   alpha=0.85,
+                   label=f"{labels_split[split]}, {labels_class[cls]}")
+
+ax.set_title(f"t-SNE of dense features (perp={PERPLEXITY}, n={N_TOTAL})")
+ax.set_xlabel("t-SNE-1")
+ax.set_ylabel("t-SNE-2")
+ax.grid(True, linestyle='--', linewidth=0.5)
+
+# combined legend
+handles, labels = ax.get_legend_handles_labels()
+unique = dict(zip(labels, handles))
+ax.legend(unique.values(), unique.keys(), frameon=True, fontsize=9)
+
+plt.tight_layout()
+
+# ---------- 4) Save figure ----------
+out_path = os.path.join(SAVE_PATH, FILENAME)
+plt.savefig(out_path, dpi=300)
+print(f"Figure saved to {out_path}")
+
+plt.show()
+
