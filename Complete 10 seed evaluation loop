@@ -1,0 +1,174 @@
+"""
+Loop over N_SEEDS random splits.  For each split we train
+• a Logistic-Regression baseline
+• the CNN
+• a Random-Forest head on frozen CNN features
+
+We store ROC-AUC, accuracy, recall, precision and per-seed runtime.
+At the end we print mean ± SD of the metrics and the average wall-time,
+and plot ROC / PR curves for the very first split.
+"""
+import re, h5py, numpy as np, matplotlib.pyplot as plt
+from pathlib import Path
+
+import time, random, numpy as np, tensorflow as tf, matplotlib.pyplot as plt
+from sklearn.model_selection          import train_test_split
+from sklearn.linear_model             import LogisticRegression
+from sklearn.ensemble                 import RandomForestClassifier
+from sklearn.metrics                  import (roc_auc_score, precision_recall_curve,
+                                              auc, accuracy_score, precision_score,
+                                              recall_score, roc_curve)
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.models           import Sequential, Model
+from tensorflow.keras.layers           import (Conv2D, BatchNormalization,
+                                               Activation, MaxPooling2D, Dropout,
+                                               Flatten, Dense)
+from tensorflow.keras.optimizers       import Adam
+from tensorflow.keras.callbacks        import ReduceLROnPlateau, EarlyStopping
+from tensorflow.keras.utils            import set_random_seed
+
+# ─── CONFIG ────────────────────────────────────────────────────────
+N_SEEDS    = 10
+AUG_TARGET = 10000
+RF_TREES   = 500
+RF_DEPTH   = 12
+#12
+X_PATH     = r"C:\Users\boris\OneDrive\Documents\X_balanced.npy"
+Y_PATH     = r"C:\Users\boris\OneDrive\Documents\y_balanced.npy"
+
+# ─── DATA ──────────────────────────────────────────────────────────
+X = np.load(X_PATH).astype("float32")[..., np.newaxis]   # (N,29,29,1)
+y = np.load(Y_PATH)
+
+# ─── CNN factory ──────────────────────────────────────────────────
+def build_cnn():
+    model = Sequential([
+        Conv2D(16,(3,3),padding='same',input_shape=(21,21,1)),
+        BatchNormalization(),Activation('relu'),
+        MaxPooling2D(2),Dropout(0.2),
+        Conv2D(32,(3,3),padding='same'),
+        BatchNormalization(),Activation('relu'),
+        MaxPooling2D(2),Dropout(0.2),
+        Flatten(name='flatfeatures'),
+        Dense(64,activation='relu',name='dense_features'),
+        Dropout(0.1),
+        Dense(1,activation='sigmoid')
+    ])
+    model.compile(optimizer=Adam(1e-4),
+              loss='binary_crossentropy',
+              metrics=['accuracy'])
+    return model
+
+CALLBACKS = [
+    ReduceLROnPlateau('val_loss',factor=0.5,patience=3,min_lr=1e-7,verbose=0),
+    EarlyStopping('val_loss',patience=5,restore_best_weights=True,verbose=0)
+]
+
+# ─── helper to compute metrics ─────────────────────────────────────
+def metrics_block(y_true, y_prob, thr=0.5):
+    y_pred = (y_prob >= thr).astype(int)
+    fpr, tpr, _              = roc_curve(y_true, y_prob)
+    rec_curve, prec_curve, _ = precision_recall_curve(y_true, y_prob)
+    return dict(
+        rocauc = auc(fpr, tpr),
+        acc    = accuracy_score (y_true, y_pred),
+        rec    = recall_score   (y_true, y_pred,zero_division=0),
+        prec_s = precision_score(y_true, y_pred,zero_division=0),
+        fpr=fpr, tpr=tpr, rec_curve=rec_curve, prec_curve=prec_curve
+    )
+
+def agg_print(name, arr):
+    arr = np.array(arr)   # cols: ROC-AUC | ACC | REC | PREC
+    print(f"{name:10}  "
+          f"ROC-AUC {arr[:,0].mean():.3f} ± {arr[:,0].std(ddof=1):.3f}   "
+          f"ACC {arr[:,1].mean():.3f} ± {arr[:,1].std(ddof=1):.3f}   "
+          f"REC {arr[:,2].mean():.3f} ± {arr[:,2].std(ddof=1):.3f}   "
+          f"PREC {arr[:,3].mean():.3f} ± {arr[:,3].std(ddof=1):.3f}")
+
+# ─── LOOP OVER SEEDS ───────────────────────────────────────────────
+rec_lr, rec_cnn, rec_rf, run_times = [], [], [], []
+first_curves = {}
+
+for seed in range(N_SEEDS):
+    t0 = time.time()                  # ── start timer
+    print(f"\n=== Seed {seed} ===")
+    random.seed(seed); np.random.seed(seed); set_random_seed(seed)
+
+    # Split 80/10/10
+    X_tr,X_tmp,y_tr,y_tmp = train_test_split(
+        X,y,test_size=0.20,random_state=seed,stratify=y)
+    X_va,X_te,y_va,y_te   = train_test_split(
+        X_tmp,y_tmp,test_size=0.50,random_state=seed,stratify=y_tmp)
+
+    # offline augmentation
+    dg   = ImageDataGenerator(horizontal_flip=True,vertical_flip=True,
+                              rotation_range=0,brightness_range=(0.95,1.05),
+                              zoom_range=0.05)
+    need = max(0,AUG_TARGET-len(X_tr))
+    if need:
+        aug_x, aug_y = [], []
+        gen = dg.flow(X_tr,y_tr,batch_size=32,shuffle=False)
+        while len(aug_x) < need:
+            xb,yb = next(gen); aug_x.extend(xb); aug_y.extend(yb)
+        X_tr = np.concatenate([X_tr,np.asarray(aug_x)],axis=0)
+        y_tr = np.concatenate([y_tr,np.asarray(aug_y)],axis=0)
+
+    # shuffle once
+    p = np.random.permutation(len(X_tr))
+    X_tr,y_tr = X_tr[p],y_tr[p]
+
+    # Logistic-Regression
+    lr = LogisticRegression(max_iter=500)
+    lr.fit(X_tr.reshape(len(X_tr),-1), y_tr)
+    mb_lr = metrics_block(y_te,
+              lr.predict_proba(X_te.reshape(len(X_te),-1))[:,1])
+    rec_lr.append([mb_lr['rocauc'], mb_lr['acc'], mb_lr['rec'], mb_lr['prec_s']])
+
+    # CNN
+    cnn = build_cnn()
+    cnn.fit(X_tr,y_tr,validation_data=(X_va,y_va),
+            epochs=15,batch_size=32,callbacks=CALLBACKS,verbose=0)
+    mb_cnn = metrics_block(y_te, cnn.predict(X_te,verbose=0).ravel())
+    rec_cnn.append([mb_cnn['rocauc'], mb_cnn['acc'], mb_cnn['rec'], mb_cnn['prec_s']])
+
+    # RF on CNN features
+    feat_ex = Model(inputs=cnn.input,
+                    outputs=cnn.get_layer("dense_features").output)
+    rf = RandomForestClassifier(n_estimators=RF_TREES,max_depth=RF_DEPTH,
+                                random_state=seed)
+    rf.fit(feat_ex.predict(X_tr,verbose=0), y_tr)
+    mb_rf = metrics_block(y_te,
+              rf.predict_proba(feat_ex.predict(X_te,verbose=0))[:,1])
+    rec_rf.append([mb_rf['rocauc'], mb_rf['acc'], mb_rf['rec'], mb_rf['prec_s']])
+
+    run_times.append(time.time() - t0)   # ── stop timer
+
+    if seed == 0:
+        first_curves = dict(lr=mb_lr, cnn=mb_cnn, rf=mb_rf)
+
+# ─── SUMMARY ───────────────────────────────────────────────────────
+print(f"\n===== Mean ± SD over {N_SEEDS} seeds =====")
+agg_print("LogReg", np.array(rec_lr))
+agg_print("CNN",     np.array(rec_cnn))
+agg_print("CNN+RF",  np.array(rec_rf))
+print(f"\nAverage wall-time per seed: "
+      f"{np.mean(run_times):.1f} s ± {np.std(run_times,ddof=1):.1f} s")
+
+# ─── PLOTS FOR SEED-0 ──────────────────────────────────────────────
+plt.figure(figsize=(4,4))
+
+plt.plot(first_curves["lr"]["fpr"],  first_curves["lr"]["tpr"],
+         label=f"LogReg AUC={first_curves['lr']['rocauc']:.3f}")
+plt.plot(first_curves["cnn"]["fpr"], first_curves["cnn"]["tpr"],
+         label=f"CNN    AUC={first_curves['cnn']['rocauc']:.3f}")
+plt.plot(first_curves["rf"]["fpr"],  first_curves["rf"]["tpr"],
+         label=f"CNN+RF AUC={first_curves['rf']['rocauc']:.3f}")
+plt.plot([0,1],[0,1],'--',color='gray')
+plt.title("ROC curves (seed 0)"); plt.xlabel("FPR"); plt.ylabel("TPR")
+plt.legend(); plt.grid(ls=":")
+out_dir = Path(r"C:\Users\boris\OneDrive\Documents\TU delft\BEP\AfbeeldingenBEP")
+out_dir.mkdir(parents=True, exist_ok=True)
+   # 3. Save it with a chosen name in that folder
+file_path = out_dir / "ROCcurves.pdf"
+plt.savefig(file_path, bbox_inches="tight")
+plt.tight_layout(); plt.show()
