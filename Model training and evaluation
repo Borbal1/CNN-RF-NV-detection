@@ -1,0 +1,190 @@
+import time, numpy as np
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import (Conv2D, BatchNormalization, Activation,
+                                     Dropout, MaxPooling2D, Flatten, Dense)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks  import ReduceLROnPlateau, EarlyStopping
+
+# ── 1) Load --------------------------------------------------------
+Path = "Put in your path"
+X = np.load(r"Path").astype("float32")
+y = np.load(r"Path")
+X = X[..., np.newaxis]  # (N,29,29,1)
+
+# ── 2) Split 80/10/10 ---------------------------------------------
+X_train, X_tmp, y_train, y_tmp = train_test_split(
+    X, y, test_size=0.20, random_state=57, stratify=y)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_tmp, y_tmp, test_size=0.50, random_state=57, stratify=y_tmp)
+print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+
+# ── 3) Offline augmentation (training only) -----------------------
+dg = ImageDataGenerator(
+    horizontal_flip=True, vertical_flip=True,
+    rotation_range=0, brightness_range=(0.8,1.2),
+    zoom_range=0.05
+)
+need = max(0, 10_000 - len(X_train))
+aug_x, aug_y = [], []
+gen = dg.flow(X_train, y_train, batch_size=32, shuffle=False, seed=57)
+while len(aug_x) < need:
+    xb, yb = next(gen)
+    aug_x.extend(xb); aug_y.extend(yb)
+if aug_x:
+    X_train = np.concatenate([X_train, np.asarray(aug_x)], axis=0)
+    y_train = np.concatenate([y_train, np.asarray(aug_y)], axis=0)
+
+# Shuffle once
+perm = np.random.permutation(len(X_train))
+X_train, y_train = X_train[perm], y_train[perm]
+
+# ── 5) Build the CNN ----------------------------------------------
+model = Sequential([
+    Conv2D(16, (3,3), padding="same", input_shape=(21,21,1)),
+    BatchNormalization(), Activation("relu"),
+    MaxPooling2D(2), Dropout(0.2),
+
+    Conv2D(32, (3,3), padding="same"),
+    BatchNormalization(), Activation("relu"),
+    MaxPooling2D(2), Dropout(0.2),
+
+    Flatten(name="flatfeatures"),
+    Dense(64, activation="relu", name="dense_features"),
+    Dropout(0.1),
+    Dense(1, activation="sigmoid")
+])
+model.compile(
+    optimizer=Adam(5e-4),
+    loss="binary_crossentropy",
+    metrics=["accuracy"]
+)
+
+# ── 6) Train (15 epochs max) --------------------------------------
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=15, batch_size=32,
+    callbacks=[
+        ReduceLROnPlateau("val_loss", factor=0.5, patience=3,
+                          min_lr=5e-7, verbose=1),
+        EarlyStopping("val_loss", patience=5,
+                      restore_best_weights=True, verbose=1)
+    ],
+    verbose=2
+)
+
+# ── 7) Final test accuracy ----------------------------------------
+loss, acc = model.evaluate(X_test, y_test, verbose=0)
+print(f"CNN test accuracy: {acc:.3f}")
+
+# ── 8) Measure latency for ONE patch ------------------------------
+_ = model.predict(X_test[:1], verbose=0)  # warm-up
+t0 = time.perf_counter()
+_ = model.predict(X_test[:1], verbose=0)
+lat_ms = (time.perf_counter() - t0) * 1_000  # ms
+print(f"Inference time for a single 21×21 patch: {lat_ms:.2f} ms")
+
+# ------------------------------------------------------------------
+# 8)  Random-Forest head (100 trees, max_depth=10) + joint evaluation
+# ------------------------------------------------------------------
+import matplotlib.pyplot as plt
+from sklearn.ensemble          import RandomForestClassifier
+from sklearn.metrics           import (
+    roc_curve, precision_recall_curve, auc,
+    confusion_matrix, accuracy_score, precision_score,
+    recall_score, f1_score
+)
+from tensorflow.keras.models   import Model
+
+# ---- 8.1  Feature extraction -------------------------------------
+feature_extractor = Model(
+    inputs  = model.input,
+    outputs = model.get_layer("dense_features").output
+)
+
+X_train_feat = feature_extractor.predict(X_train, verbose=0)
+X_test_feat  = feature_extractor.predict(X_test,  verbose=0)
+
+# ---- 8.2  Fit Random-Forest (fixed hyper-params) -----------------
+rf = RandomForestClassifier(n_estimators = 500,max_depth    = 10,random_state = 42,)
+rf.fit(X_train_feat, y_train)
+
+# ------------------------------------------------------------------
+# 9)  Metrics & curves for *both* CNN and RF
+# ------------------------------------------------------------------
+def calc_metrics(y_true, y_prob, y_pred):
+    fpr,  tpr,  _ = roc_curve(y_true, y_prob)
+    prec_curve, rec_curve, _ = precision_recall_curve(y_true, y_prob)
+
+    return {
+        "fpr"    : fpr,
+        "tpr"    : tpr,
+        "rocauc" : auc(fpr, tpr),
+        "rec"    : rec_curve,
+        "prec"   : prec_curve,
+        "prauc"  : auc(rec_curve, prec_curve),
+        "cm"     : confusion_matrix(y_true, y_pred),
+        "acc"    : accuracy_score (y_true, y_pred),
+        "prec_s" : precision_score(y_true, y_pred, zero_division=0),
+        "rec_s"  : recall_score   (y_true, y_pred, zero_division=0),
+        "f1"     : f1_score       (y_true, y_pred, zero_division=0)
+    }
+
+# ---- CNN ----------------------------------------------------------
+cnn_prob = model.predict(X_test, verbose=0).ravel()
+cnn_pred = (cnn_prob >= 0.50).astype(int)
+m_cnn    = calc_metrics(y_test, cnn_prob, cnn_pred)
+
+# ---- RF  ----------------------------------------------------------
+rf_prob  = rf.predict_proba(X_test_feat)[:, 1]
+rf_pred  = (rf_prob >= 0.50).astype(int)
+m_rf     = calc_metrics(y_test, rf_prob, rf_pred)
+
+# ------------------------------------------------------------------
+# 10)  Print confusion matrices & scalar metrics
+# ------------------------------------------------------------------
+def print_block(name, m):
+    print(f"\n=== {name} ===")
+    print("Confusion matrix [[TN FP]\n                    [FN TP]]:")
+    print(m["cm"])
+    print(f"Accuracy : {m['acc'] :.3f}")
+    print(f"Precision: {m['prec_s']:.3f}")
+    print(f"Recall   : {m['rec_s'] :.3f}")
+    print(f"F1-score : {m['f1']    :.3f}")
+    print(f"ROC-AUC  : {m['rocauc']:.3f}")
+    print(f"PR-AUC   : {m['prauc'] :.3f}")
+
+print_block("CNN", m_cnn)
+print_block("RF (100 trees, depth 10)", m_rf)
+
+# ------------------------------------------------------------------
+# 11)  Plot ROC & PR curves
+# ------------------------------------------------------------------
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12,5))
+
+# ROC
+ax1.plot(m_cnn["fpr"], m_cnn["tpr"],
+         label=f"CNN  AUC = {m_cnn['rocauc']:.3f}")
+ax1.plot(m_rf ["fpr"], m_rf ["tpr"],
+         label=f"RF   AUC = {m_rf ['rocauc']:.3f}")
+ax1.plot([0,1],[0,1],'--', color='gray')
+ax1.set_xlabel("False Positive Rate")
+ax1.set_ylabel("True Positive Rate (Recall)")
+ax1.set_title("ROC curve")
+ax1.legend()
+
+# PR
+ax2.plot(m_cnn["rec"], m_cnn["prec"],
+         label=f"CNN  AP = {m_cnn['prauc']:.3f}")
+ax2.plot(m_rf ["rec"], m_rf ["prec"],
+         label=f"RF   AP = {m_rf ['prauc']:.3f}")
+ax2.set_xlabel("Recall")
+ax2.set_ylabel("Precision")
+ax2.set_title("Precision–Recall curve")
+ax2.legend()
+
+plt.tight_layout()
+plt.show()
+
