@@ -2,7 +2,7 @@
 Background-subtract, balance, save, rotate and *visualise* one GOOD / one BAD
 patch per scan, with the sample folder (e.g. 04A2, 07C1) shown in the
 header cell above each column (it stays inside the white space, so it
-cannot overlap the images).
+cannot overlap the images). Data had to be parsed.
 """
 
 import re, h5py, numpy as np, matplotlib.pyplot as plt
@@ -24,6 +24,7 @@ BG_PATH    = "/settings/min_background_level"
 PIXEL_SIZE_NM_FALLBACK = 100
 PATCH_SIZE = 21
 h          = PATCH_SIZE // 2
+User path = " "
 
 pat = re.compile(r"x=([-\d\.]+),\s*y=([-\d\.]+).*-\s*(GOOD|BAD)", re.I)
 
@@ -101,7 +102,7 @@ rng.shuffle(sel_idx)
 X_bal = all_patches[sel_idx]
 y_bal = all_labels[sel_idx]
 
-out_dir = Path(r"C:\Users\boris\OneDrive\Documents")
+out_dir = Path(r"Path") #Put in your path
 np.save(out_dir / "X_balanced.npy", X_bal)
 np.save(out_dir / "y_balanced.npy", y_bal)
 print("Saved balanced, background-subtracted data:", X_bal.shape, y_bal.shape)
