@@ -1,0 +1,99 @@
+import time
+import h5py
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from skimage.feature import blob_log
+from skimage import exposure
+from scipy.ndimage import gaussian_filter
+from tensorflow.keras.models import load_model, Model
+import joblib
+from matplotlib.patches import Rectangle
+
+# ── CONFIG ─────────────────────────────────────────────────────────
+SCAN_BASE_DIR   = Path(r"C:\Users\boris\OneDrive\Documents\TU delft\BEP\RTCS DATA\04A2\scan_fields\T1_0")
+IMG_PATH        = "/xy_scan/spatial_scan/photon_flux"
+BG_PATH         = "/settings/min_background_level"
+CNN_PATH        = "cnn_nv_model.keras"
+RF_PATH         = "rf_nv_classifier.joblib"
+PATCH_SIZE      = 21
+h               = PATCH_SIZE // 2
+TOP_K           = 5
+SQUARE_SIZE     = 15
+half_sq         = SQUARE_SIZE // 2
+
+# 1) automatically pick the first *Candidates.h5 in the folder
+h5_files = list(SCAN_BASE_DIR.glob("*Candidates.h5"))
+if not h5_files:
+    raise FileNotFoundError(f"No *Candidates.h5 in {SCAN_BASE_DIR}")
+H5_PATH = h5_files[0]
+
+# Start timer
+t0 = time.perf_counter()
+
+# 2) load that scan
+with h5py.File(H5_PATH, "r") as f:
+    img = f[IMG_PATH][()].astype("float32")
+    bg  = float(f[BG_PATH][()]) if BG_PATH in f else 0.0
+
+# 3) preprocess
+img  = np.clip(img - bg, 0, None)
+norm = exposure.rescale_intensity(img, out_range=(0,1))
+
+# 4) high-pass background removal
+blurred = gaussian_filter(norm, sigma=5)
+hp      = exposure.rescale_intensity(norm - blurred, out_range=(0,1))
+
+# 5) detect blobs
+blobs = blob_log(hp,
+                 min_sigma=1.5, max_sigma=2.2,
+                 num_sigma=10, threshold=0.03)
+blobs = [b for b in blobs if 1.5 < b[2] < 2.05]
+
+# 6) extract patches & coords
+X, coords = [], []
+for y, x, s in blobs:
+    y, x = int(round(y)), int(round(x))
+    y0, y1 = y-h, y+h+1
+    x0, x1 = x-h, x+h+1
+    if 0 <= y0 and 0 <= x0 and y1 <= img.shape[0] and x1 <= img.shape[1]:
+        X.append(img[y0:y1, x0:x1])
+        coords.append((x, y, s))
+X = np.stack(X)[..., np.newaxis]
+
+# 7) classify with CNN + RF
+cnn        = load_model(CNN_PATH)
+rf         = joblib.load(RF_PATH)
+feat_model = Model(cnn.input, cnn.get_layer("dense_features").output)
+feats      = feat_model.predict(X, verbose=0)
+probs      = rf.predict_proba(feats)[:, 1]
+
+# 8) pick top K by probability
+top_idx   = np.argsort(probs)[-TOP_K:]
+top_blobs = [coords[i] for i in top_idx]
+top_probs = probs[top_idx]
+
+# End timer
+t1 = time.perf_counter()
+print(f"Full scan processing time: {(t1 - t0)*1000:.1f} ms")
+
+# 9) overlay squares on original normalized image
+fig, ax = plt.subplots(figsize=(6, 6))
+ax.imshow(norm, cmap="hot")
+for (x, y, _), p in zip(top_blobs, top_probs):
+    rect = Rectangle(
+        (x - half_sq, y - half_sq),
+        SQUARE_SIZE, SQUARE_SIZE,
+        edgecolor="green", facecolor="none", lw=2
+    )
+    ax.add_patch(rect)
+    ax.text(x, y - half_sq - 2, f"{p:.2f}",
+            color="yellow", ha="center", va="bottom", fontsize=8)
+ax.set_axis_off()
+plt.tight_layout()
+out_dir = Path(r"C:\Users\boris\OneDrive\Documents\TU delft\BEP\AfbeeldingenBEP")
+out_dir.mkdir(parents=True, exist_ok=True)
+   # 3. Save it with a chosen name in that folder
+file_path = out_dir / "finalresultsss.pdf"
+plt.savefig(file_path, bbox_inches="tight")
+plt.show()
